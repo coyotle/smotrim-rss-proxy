@@ -1,34 +1,36 @@
-use actix_web::{get, web, HttpResponse, Responder};
+use actix_web::{
+    http::{header, Method},
+    route, web, HttpRequest, HttpResponse, Responder,
+};
 use chrono::Utc;
 use clap::Parser;
-use smotrim::Podcast;
+use std::time::SystemTime;
 use tokio::sync::Mutex;
 use tokio_rusqlite::Connection;
 
-mod cache;
-mod database;
-mod smotrim;
+pub mod cache;
+pub mod custom_date;
+pub mod database;
+pub mod smotrim;
+
+use smotrim::fetch_api_response;
+use smotrim::Podcast;
 
 #[derive(Parser, Debug)]
 #[clap(about, version, author)]
 pub struct Args {
-    /// IP для запуска сервера
     #[clap(short, long, default_value = "127.0.0.1")]
     pub ip: String,
 
-    /// TCP порт сервера
     #[clap(short, long, default_value = "3000")]
     pub port: u16,
 
-    /// Количество эпизодов
     #[clap(short, long, default_value = "20")]
     pub limit: u16,
 
-    /// Время жизни кэша в секундах
     #[clap(short, long, default_value = "600")]
     pub cache_lifetime: u16,
 
-    /// Путь к sqlite базе для хранения данных
     #[clap(short, long, default_value = "data.sqlite")]
     pub db_path: String,
 }
@@ -38,12 +40,16 @@ pub struct AppState {
     pub db: Mutex<Connection>,
 }
 
-#[get("/brand/{id}")]
-async fn proxy(id: web::Path<String>, app_data: web::Data<AppState>) -> impl Responder {
+#[route("/brand/{id}", method = "GET", method = "HEAD")]
+async fn proxy(
+    id: web::Path<String>,
+    app_data: web::Data<AppState>,
+    req: HttpRequest,
+) -> impl Responder {
     let brand_id: u64 = match id.parse() {
         Ok(num) => num,
         Err(err) => {
-            eprintln!("Error parse brand_id: {}", err);
+            eprintln!("Error parsing brand_id: {}", err);
             return HttpResponse::BadRequest().body("Failed to parse brand_id");
         }
     };
@@ -53,29 +59,22 @@ async fn proxy(id: web::Path<String>, app_data: web::Data<AppState>) -> impl Res
 
     let mut feed_cache = cache::FEEDS_CACHE.lock().await;
 
-    let cached_data = feed_cache.get(&id.to_string());
-    let current_time = Utc::now().timestamp();
-
-    if let Some(cached_rss) = cached_data {
+    if let Some(cached_rss) = feed_cache.get(&id.to_string()) {
         let cache_lifetime = app_data.config.cache_lifetime;
-        if current_time - cached_rss.cached_at < cache_lifetime.into() {
-            return HttpResponse::Ok()
-                .content_type("application/rss+xml")
-                .body(cached_rss.body.clone());
+        if Utc::now().timestamp() - cached_rss.cached_at < cache_lifetime.into() {
+            return create_response(&req, &cached_rss.body, cached_rss.cached_at);
         }
     }
 
-    let json_text_result = smotrim::fetch_text(&api_url).await;
-    let json_text = match json_text_result {
+    let json_text = match fetch_api_response(&api_url).await {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("Error fetching text: {}", e);
-            return HttpResponse::BadGateway().body("Failed to fetch data");
+            eprintln!("Error fetching api response: {}", e);
+            return HttpResponse::BadGateway().body("Failed to fetch api response");
         }
     };
 
-    let json_result = serde_json::from_str(&json_text);
-    let json = match json_result {
+    let json = match serde_json::from_str(&json_text) {
         Ok(j) => j,
         Err(e) => {
             eprintln!("Failed to parse JSON: {}", e);
@@ -83,9 +82,7 @@ async fn proxy(id: web::Path<String>, app_data: web::Data<AppState>) -> impl Res
         }
     };
 
-    let podcast_result = Podcast::from_json(app_data, brand_id, &json).await;
-
-    let podcast = match podcast_result {
+    let podcast = match Podcast::from_json(app_data, brand_id, &json).await {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Failed to create Podcast from JSON: {}", e);
@@ -94,6 +91,7 @@ async fn proxy(id: web::Path<String>, app_data: web::Data<AppState>) -> impl Res
     };
 
     let rss = podcast.to_string();
+    let current_time = Utc::now().timestamp();
 
     feed_cache.insert(
         id.to_string(),
@@ -103,7 +101,23 @@ async fn proxy(id: web::Path<String>, app_data: web::Data<AppState>) -> impl Res
         },
     );
 
-    HttpResponse::Ok()
-        .content_type("application/rss+xml")
-        .body(rss)
+    create_response(&req, &rss, current_time)
+}
+
+fn create_response(req: &HttpRequest, body: &str, cached_at: i64) -> HttpResponse {
+    let last_modified = header::HttpDate::from(
+        SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(cached_at as u64),
+    );
+
+    let mut response = HttpResponse::Ok();
+    response.insert_header((header::CONTENT_TYPE, "application/rss+xml"));
+    response.insert_header((header::LAST_MODIFIED, last_modified.to_string()));
+
+    if req.method() == Method::HEAD {
+        response
+            .insert_header((header::CONTENT_LENGTH, body.len()))
+            .finish()
+    } else {
+        response.body(body.to_string())
+    }
 }

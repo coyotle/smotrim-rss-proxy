@@ -1,14 +1,13 @@
 use actix_web::web;
-use chrono::format::strftime::StrftimeItems;
-use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
-use chrono_tz::Europe;
+use chrono::Utc;
 use reqwest::header::{HeaderMap, USER_AGENT};
 use scraper::{Html, Selector};
 use serde_json::Value;
-use std::collections::HashMap;
 use std::error::Error;
 use tokio_rusqlite::params;
 
+use crate::custom_date::format_rfc822;
+use crate::custom_date::parse_custom_date;
 use crate::AppState;
 
 fn build_user_agent() -> HeaderMap {
@@ -19,7 +18,7 @@ fn build_user_agent() -> HeaderMap {
     headers
 }
 
-pub async fn fetch_text(url: &str) -> Result<String, Box<dyn Error>> {
+pub async fn fetch_api_response(url: &str) -> Result<String, Box<dyn Error>> {
     let client = reqwest::Client::new();
     let response_text = client
         .get(url)
@@ -48,7 +47,7 @@ pub async fn fetch_brand_description(id: u64) -> Result<String, Box<dyn Error>> 
         return Ok(text);
     }
 
-    return Err("Can't parse brand description".into());
+    Err("Can't parse brand description".into())
 }
 
 pub async fn get_content_length(url: &str) -> Result<u64, Box<dyn Error>> {
@@ -80,15 +79,19 @@ impl Podcast {
         id: u64,
         json: &Value,
     ) -> Result<Self, Box<dyn Error>> {
-        let episodes: Vec<Episode> = create_episodes(app_data, json, id).await?;
+        let episodes = create_episodes(app_data, json, id).await?;
+        let title = json["contents"][0]["list"][0]["title"].to_string();
+        let link = format!("https://smotrim.ru/brand/{}", id);
+        let description = fetch_brand_description(id).await.unwrap_or("".into());
+        let image =
+            json["contents"][0]["list"][0]["player"]["preview"]["source"]["main"].to_string();
 
         Ok(Self {
             id,
-            title: json["contents"][0]["list"][0]["title"].to_string(),
-            link: format!("https://smotrim.ru/brand/{}", id),
-            description: fetch_brand_description(id).await.unwrap_or("".into()),
-            image: json["contents"][0]["list"][0]["player"]["preview"]["source"]["main"]
-                .to_string(),
+            title,
+            link,
+            description,
+            image,
             episodes,
         })
     }
@@ -225,21 +228,26 @@ struct Episode {
 
 impl Episode {
     fn from_json(item: &Value, brand_id: u64, media_size: u64) -> Result<Self, Box<dyn Error>> {
+        let id = item["id"].to_string();
+        let title = item["anons"].to_string().replace("\\\"", "");
+        let description = item["description"].to_string().replace("\\\"", "");
+        let duration = item["duration"].to_string().replace("\"", "");
+        let published = format_rfc822(parse_custom_date(&item["published"].to_string())?);
+        let image = item["player"]["preview"]["source"]["main"]
+            .to_string()
+            .trim_matches('"')
+            .to_string();
+        let media_url = format!("https://vgtrk-podcast.cdnvideo.ru/audio/listen?id={}", id);
+
         Ok(Episode {
-            id: item["id"].to_string(),
+            id,
             brand_id: brand_id.to_string(),
-            title: item["anons"].to_string().replace("\\\"", ""),
-            description: item["description"].to_string().replace("\\\"", ""),
-            duration: item["duration"].to_string().replace("\"", ""),
-            published: format_rfc822(parse_custom_date(&item["published"].to_string())?),
-            image: item["player"]["preview"]["source"]["main"]
-                .to_string()
-                .trim_matches('"')
-                .to_string(),
-            media_url: format!(
-                "https://vgtrk-podcast.cdnvideo.ru/audio/listen?id={}",
-                item["id"]
-            ),
+            title,
+            description,
+            duration,
+            published,
+            image,
+            media_url,
             media_size,
         })
     }
@@ -265,66 +273,4 @@ impl Episode {
             image = self.image
         )
     }
-}
-
-fn parse_custom_date(date_str: &str) -> Result<DateTime<Utc>, Box<dyn std::error::Error>> {
-    let months_ru = [
-        ("января", 1),
-        ("февраля", 2),
-        ("марта", 3),
-        ("апреля", 4),
-        ("мая", 5),
-        ("июня", 6),
-        ("июля", 7),
-        ("августа", 8),
-        ("сентября", 9),
-        ("октября", 10),
-        ("ноября", 11),
-        ("декабря", 12),
-    ]
-    .iter()
-    .cloned()
-    .collect::<HashMap<&str, u32>>();
-
-    let date_str = date_str.trim_matches('"');
-
-    // Если дата в формате "10:06" (только время)
-    if date_str.len() <= 5 && date_str.contains(':') {
-        let today = Local::now().date_naive();
-        // Парсим время
-        let time = NaiveTime::parse_from_str(date_str, "%H:%M")?;
-        // Создаем NaiveDateTime из сегодняшней даты и времени
-        let datetime = NaiveDateTime::new(today, time);
-        let moscow_time = Europe::Moscow
-            .from_local_datetime(&datetime)
-            .single()
-            .unwrap();
-
-        Ok(moscow_time.with_timezone(&Utc))
-    }
-    // Если дата в формате "05 февраля 2025"
-    else {
-        let parts: Vec<&str> = date_str.split_whitespace().collect();
-        if parts.len() != 3 {
-            return Err("Invalid date format".into());
-        }
-
-        let day = parts[0].parse::<u32>()?;
-        let month = *months_ru.get(parts[1]).ok_or("Invalid month")?;
-        let year = parts[2].parse::<i32>()?;
-
-        // Создаем NaiveDate
-        let date = NaiveDate::from_ymd_opt(year, month, day).ok_or("Invalid date")?;
-        let datetime = NaiveDateTime::new(date, NaiveTime::from_hms_opt(0, 0, 0).unwrap());
-        let moscow_time = Europe::Moscow
-            .from_local_datetime(&datetime)
-            .single()
-            .unwrap();
-        Ok(moscow_time.with_timezone(&Utc))
-    }
-}
-
-fn format_rfc822(datetime: DateTime<Utc>) -> String {
-    let format = StrftimeItems::new("%a, %d %b %Y %H:%M:%S %z");
-    datetime.format_with_items(format).to_string()
 }

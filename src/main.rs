@@ -4,14 +4,16 @@ use smotrim_rss_proxy::{proxy, AppState, Args};
 use tokio::sync::Mutex;
 
 mod database;
-mod smotrim;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     let args = Args::parse();
     let address = format!("{}:{}", args.ip, args.port);
 
-    let conn = database::init_db(&args.db_path).await.unwrap();
+    let conn = database::init_db(&args.db_path).await.map_err(|e| {
+        eprintln!("Failed to initialize database: {}", e);
+        std::io::Error::new(std::io::ErrorKind::Other, "Database initialization failed")
+    })?;
     let db_conn = Mutex::new(conn.clone());
 
     let app_state = web::Data::new(AppState {
