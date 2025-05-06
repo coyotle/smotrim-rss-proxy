@@ -212,6 +212,11 @@ async fn create_episodes(
     Ok(result)
 }
 
+fn strip_html_tags(html: &str) -> String {
+    let document = Html::parse_document(html);
+    document.root_element().text().collect()
+}
+
 //
 #[derive(Debug, Clone)]
 struct Episode {
@@ -230,7 +235,8 @@ impl Episode {
     fn from_json(item: &Value, brand_id: u64, media_size: u64) -> Result<Self, Box<dyn Error>> {
         let id = item["id"].to_string();
         let title = item["anons"].to_string().replace("\\\"", "");
-        let description = item["description"].to_string().replace("\\\"", "");
+        let raw_description = item["description"].to_string().replace("\\\"", "");
+        let description = strip_html_tags(&raw_description);
         let duration = item["duration"].to_string().replace("\"", "");
         let published = format_rfc822(parse_custom_date(&item["published"].to_string())?);
         let image = item["player"]["preview"]["source"]["main"]
